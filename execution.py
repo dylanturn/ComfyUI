@@ -215,7 +215,18 @@ async def resolve_map_node_over_list_results(results):
                 raise exc
         return [x.result() if isinstance(x, asyncio.Task) else x for x in results]
 
-async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, func, allow_interrupt=False, execution_block_cb=None, pre_execute_cb=None, hidden_inputs=None):
+async def _async_map_node_over_list(
+    prompt_id,
+    unique_id,
+    obj,
+    input_data_all,
+    func,
+    allow_interrupt=False,
+    execution_block_cb=None,
+    pre_execute_cb=None,
+    hidden_inputs=None,
+    run_in_executor: bool = False,
+):
     # check if node wants the lists
     input_is_list = getattr(obj, "INPUT_IS_LIST", False)
 
@@ -274,8 +285,14 @@ async def _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, f
                 else:
                     results.append(task)
             else:
-                with CurrentNodeContext(prompt_id, unique_id, index):
-                    result = f(**inputs)
+                def call_sync():
+                    with CurrentNodeContext(prompt_id, unique_id, index):
+                        return f(**inputs)
+
+                if run_in_executor:
+                    result = await asyncio.to_thread(call_sync)
+                else:
+                    result = call_sync()
                 results.append(result)
         else:
             results.append(execution_block)
@@ -312,8 +329,28 @@ def merge_result_data(results, obj):
             output.append([o[i] for o in results])
     return output
 
-async def get_output_data(prompt_id, unique_id, obj, input_data_all, execution_block_cb=None, pre_execute_cb=None, hidden_inputs=None):
-    return_values = await _async_map_node_over_list(prompt_id, unique_id, obj, input_data_all, obj.FUNCTION, allow_interrupt=True, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb, hidden_inputs=hidden_inputs)
+async def get_output_data(
+    prompt_id,
+    unique_id,
+    obj,
+    input_data_all,
+    execution_block_cb=None,
+    pre_execute_cb=None,
+    hidden_inputs=None,
+    run_in_executor: bool = False,
+):
+    return_values = await _async_map_node_over_list(
+        prompt_id,
+        unique_id,
+        obj,
+        input_data_all,
+        obj.FUNCTION,
+        allow_interrupt=True,
+        execution_block_cb=execution_block_cb,
+        pre_execute_cb=pre_execute_cb,
+        hidden_inputs=hidden_inputs,
+        run_in_executor=run_in_executor,
+    )
     has_pending_task = any(isinstance(r, asyncio.Task) and not r.done() for r in return_values)
     if has_pending_task:
         return return_values, {}, False, has_pending_task
@@ -393,7 +430,19 @@ def format_value(x):
     else:
         return str(x)
 
-async def execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes):
+async def execute(
+    server,
+    dynprompt,
+    caches,
+    current_item,
+    extra_data,
+    executed,
+    prompt_id,
+    execution_list,
+    pending_subgraph_results,
+    pending_async_nodes,
+    run_in_executor: bool = False,
+):
     unique_id = current_item
     real_node_id = dynprompt.get_real_node_id(unique_id)
     display_node_id = dynprompt.get_display_node_id(unique_id)
@@ -495,7 +544,16 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
             def pre_execute_cb(call_index):
                 # TODO - How to handle this with async functions without contextvars (which requires Python 3.12)?
                 GraphBuilder.set_default_prefix(unique_id, call_index, 0)
-            output_data, output_ui, has_subgraph, has_pending_tasks = await get_output_data(prompt_id, unique_id, obj, input_data_all, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb, hidden_inputs=hidden_inputs)
+            output_data, output_ui, has_subgraph, has_pending_tasks = await get_output_data(
+                prompt_id,
+                unique_id,
+                obj,
+                input_data_all,
+                execution_block_cb=execution_block_cb,
+                pre_execute_cb=pre_execute_cb,
+                hidden_inputs=hidden_inputs,
+                run_in_executor=run_in_executor,
+            )
             if has_pending_tasks:
                 pending_async_nodes[unique_id] = output_data
                 unblock = execution_list.add_external_block(unique_id)
@@ -946,6 +1004,7 @@ class PromptExecutor:
                 execution_list,
                 pending_subgraph_results,
                 pending_async_nodes,
+                run_in_executor=True,
             )
             for node_id in node_ids
         ]
@@ -975,6 +1034,7 @@ class PromptExecutor:
                     execution_list,
                     pending_subgraph_results,
                     pending_async_nodes,
+                    run_in_executor=True,
                 )
             node_results.update(new_results)
             pending_nodes = [node_id for node_id, (res, _, _) in new_results.items() if res == ExecutionResult.PENDING]

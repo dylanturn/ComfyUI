@@ -90,6 +90,40 @@ class BatchOutputNode:
         return ()
 
 
+class BlockingBatchNodeA:
+    CATEGORY = "tests"
+    FUNCTION = "execute"
+    RETURN_TYPES = ("STRING",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    @classmethod
+    def execute(cls):
+        BatchBarrier.results.append(("block_start", "A", time.perf_counter()))
+        time.sleep(0.05)
+        BatchBarrier.results.append(("block_end", "A", time.perf_counter()))
+        return ("A",)
+
+
+class BlockingBatchNodeB:
+    CATEGORY = "tests"
+    FUNCTION = "execute"
+    RETURN_TYPES = ("STRING",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    @classmethod
+    def execute(cls):
+        BatchBarrier.results.append(("block_start", "B", time.perf_counter()))
+        time.sleep(0.05)
+        BatchBarrier.results.append(("block_end", "B", time.perf_counter()))
+        return ("B",)
+
+
 class AsyncSourceFast:
     CATEGORY = "tests"
     FUNCTION = "execute"
@@ -158,6 +192,8 @@ def register_batch_nodes():
         "BatchNodeA": BatchNodeA,
         "BatchNodeB": BatchNodeB,
         "BatchOutputNode": BatchOutputNode,
+        "BlockingBatchNodeA": BlockingBatchNodeA,
+        "BlockingBatchNodeB": BlockingBatchNodeB,
         "AsyncSourceFast": AsyncSourceFast,
         "AsyncSourceSlow": AsyncSourceSlow,
         "DependentBatchNodeA": DependentBatchNodeA,
@@ -221,6 +257,51 @@ async def test_batch_group_executes_nodes_concurrently():
     assert start_indices[-1] < first_end_index
     end_indices = [i for i, entry in enumerate(BatchBarrier.results) if entry[0] == "end"]
     assert all(i < output_index for i in end_indices)
+
+
+@pytest.mark.asyncio
+async def test_batch_group_runs_blocking_nodes_with_threaded_execution():
+    BatchBarrier.reset()
+    server = DummyServer()
+    executor = PromptExecutor(server)
+
+    prompt = {
+        "100": {"class_type": "BlockingBatchNodeA", "inputs": {}},
+        "101": {"class_type": "BlockingBatchNodeB", "inputs": {}},
+        "102": {
+            "class_type": "BatchOutputNode",
+            "inputs": {
+                "first": ["100", 0],
+                "second": ["101", 0],
+            },
+        },
+    }
+
+    extra_data = {
+        "node_execution_groups": {
+            "group": {
+                "variant": "batch",
+                "nodes": ["100", "101"],
+            }
+        }
+    }
+
+    start = time.perf_counter()
+    await executor.execute_async(prompt, "test_prompt", extra_data, execute_outputs=["102"])
+    duration = time.perf_counter() - start
+
+    assert executor.success
+
+    block_starts = [entry for entry in BatchBarrier.results if entry[0] == "block_start"]
+    block_ends = [entry for entry in BatchBarrier.results if entry[0] == "block_end"]
+    assert len(block_starts) == 2
+    assert len(block_ends) == 2
+
+    first_end_index = min(i for i, entry in enumerate(BatchBarrier.results) if entry[0] == "block_end")
+    last_start_index = max(i for i, entry in enumerate(BatchBarrier.results) if entry[0] == "block_start")
+    assert last_start_index < first_end_index
+
+    assert duration < 0.09
 
 
 @pytest.mark.asyncio
