@@ -191,12 +191,37 @@ class ExecutionList(TopologicalSort):
     ExecutionList implements a topological dissolve of the graph. After a node is staged for execution,
     it can still be returned to the graph after having further dependencies added.
     """
-    def __init__(self, dynprompt, output_cache):
+    def __init__(self, dynprompt, output_cache, group_config=None):
         super().__init__(dynprompt)
         self.output_cache = output_cache
-        self.staged_node_id = None
+        self.staged_node_ids = None
         self.execution_cache = {}
         self.execution_cache_listeners = {}
+        self.node_to_batch_group = {}
+        self.batch_groups = {}
+
+        if group_config is None:
+            group_config = {}
+
+        for group_id, group_details in group_config.items():
+            variant = group_details.get("variant")
+            if not isinstance(variant, str) or variant.lower() != "batch":
+                continue
+
+            members = set()
+            for node_id in group_details.get("nodes", set()):
+                if dynprompt.has_node(node_id):
+                    members.add(node_id)
+
+            if not members:
+                continue
+
+            self.batch_groups[group_id] = {
+                "nodes": members,
+                "pending": set(),
+            }
+            for node_id in members:
+                self.node_to_batch_group[node_id] = group_id
 
     def is_cached(self, node_id):
         return self.output_cache.get(node_id) is not None
@@ -208,6 +233,22 @@ class ExecutionList(TopologicalSort):
         if not from_node_id in self.execution_cache_listeners:
             self.execution_cache_listeners[from_node_id] = set()
         self.execution_cache_listeners[from_node_id].add(to_node_id)
+
+    def _register_pending_node(self, node_id):
+        group_id = self.node_to_batch_group.get(node_id)
+        if group_id is None:
+            return
+        batch_info = self.batch_groups.get(group_id)
+        if batch_info is None:
+            return
+        batch_info["pending"].add(node_id)
+
+    def add_node(self, node_unique_id, include_lazy=False, subgraph_nodes=None):
+        prior_nodes = set(self.pendingNodes.keys())
+        super().add_node(node_unique_id, include_lazy=include_lazy, subgraph_nodes=subgraph_nodes)
+        new_nodes = set(self.pendingNodes.keys()) - prior_nodes
+        for node_id in new_nodes:
+            self._register_pending_node(node_id)
 
     def get_output_cache(self, from_node_id, to_node_id):
         if not to_node_id in self.execution_cache:
@@ -224,7 +265,7 @@ class ExecutionList(TopologicalSort):
         self.cache_link(from_node_id, to_node_id)
 
     async def stage_node_execution(self):
-        assert self.staged_node_id is None
+        assert self.staged_node_ids is None
         if self.is_empty():
             return None, None, None
         available = self.get_ready_nodes()
@@ -233,28 +274,81 @@ class ExecutionList(TopologicalSort):
             await self.unblockedEvent.wait()
             self.unblockedEvent.clear()
             available = self.get_ready_nodes()
-        if len(available) == 0:
-            cycled_nodes = self.get_nodes_in_cycle()
-            # Because cycles composed entirely of static nodes are caught during initial validation,
-            # we will 'blame' the first node in the cycle that is not a static node.
-            blamed_node = cycled_nodes[0]
-            for node_id in cycled_nodes:
-                display_node_id = self.dynprompt.get_display_node_id(node_id)
-                if display_node_id != node_id:
-                    blamed_node = display_node_id
-                    break
-            ex = DependencyCycleError("Dependency cycle detected")
+        while True:
+            ready_candidates = []
+            ready_batch_groups = {}
+            seen_batch_groups = set()
+            for node_id in available:
+                group_id = self.node_to_batch_group.get(node_id)
+                if group_id is None:
+                    ready_candidates.append(node_id)
+                    continue
+
+                batch_info = self.batch_groups.get(group_id)
+                if batch_info is None:
+                    ready_candidates.append(node_id)
+                    continue
+
+                pending_members = batch_info["pending"]
+                if not pending_members:
+                    continue
+
+                if all(self.blockCount.get(member, 0) == 0 for member in pending_members):
+                    if group_id not in seen_batch_groups:
+                        ready_candidates.append(node_id)
+                        seen_batch_groups.add(group_id)
+                    ready_batch_groups[group_id] = list(pending_members)
+
+            if len(ready_candidates) > 0:
+                pick = self.ux_friendly_pick_node(ready_candidates)
+                group_id = self.node_to_batch_group.get(pick)
+                if group_id and group_id in ready_batch_groups:
+                    staged_nodes = sorted(ready_batch_groups[group_id])
+                else:
+                    staged_nodes = [pick]
+
+                self.staged_node_ids = list(staged_nodes)
+                if len(staged_nodes) == 1:
+                    return staged_nodes[0], None, None
+                return list(staged_nodes), None, None
+
+            if len(available) == 0:
+                cycled_nodes = self.get_nodes_in_cycle()
+                # Because cycles composed entirely of static nodes are caught during initial validation,
+                # we will 'blame' the first node in the cycle that is not a static node.
+                blamed_node = cycled_nodes[0]
+                for node_id in cycled_nodes:
+                    display_node_id = self.dynprompt.get_display_node_id(node_id)
+                    if display_node_id != node_id:
+                        blamed_node = display_node_id
+                        break
+                ex = DependencyCycleError("Dependency cycle detected")
+                error_details = {
+                    "node_id": blamed_node,
+                    "exception_message": str(ex),
+                    "exception_type": "graph.DependencyCycleError",
+                    "traceback": [],
+                    "current_inputs": []
+                }
+                return None, error_details, ex
+
+            if self.externalBlocks > 0:
+                await self.unblockedEvent.wait()
+                self.unblockedEvent.clear()
+                available = self.get_ready_nodes()
+                continue
+
+            first_available = available[0]
+            display_node_id = self.dynprompt.get_display_node_id(first_available)
+            ex = DependencyCycleError("Batch group members have unsatisfied dependencies")
             error_details = {
-                "node_id": blamed_node,
+                "node_id": display_node_id,
                 "exception_message": str(ex),
                 "exception_type": "graph.DependencyCycleError",
                 "traceback": [],
                 "current_inputs": []
             }
             return None, error_details, ex
-
-        self.staged_node_id = self.ux_friendly_pick_node(available)
-        return self.staged_node_id, None, None
 
     def ux_friendly_pick_node(self, node_list):
         # If an output node is available, do that first.
@@ -296,15 +390,19 @@ class ExecutionList(TopologicalSort):
         return node_list[0]
 
     def unstage_node_execution(self):
-        assert self.staged_node_id is not None
-        self.staged_node_id = None
+        assert self.staged_node_ids is not None
+        self.staged_node_ids = None
 
     def complete_node_execution(self):
-        node_id = self.staged_node_id
-        self.pop_node(node_id)
-        self.execution_cache.pop(node_id, None)
-        self.execution_cache_listeners.pop(node_id, None)
-        self.staged_node_id = None
+        assert self.staged_node_ids is not None
+        for node_id in self.staged_node_ids:
+            self.pop_node(node_id)
+            self.execution_cache.pop(node_id, None)
+            self.execution_cache_listeners.pop(node_id, None)
+            group_id = self.node_to_batch_group.get(node_id)
+            if group_id in self.batch_groups:
+                self.batch_groups[group_id]["pending"].discard(node_id)
+        self.staged_node_ids = None
 
     def get_nodes_in_cycle(self):
         # We'll dissolve the graph in reverse topological order to leave only the nodes in the cycle.

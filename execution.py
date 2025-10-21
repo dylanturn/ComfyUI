@@ -41,6 +41,204 @@ class ExecutionResult(Enum):
     FAILURE = 1
     PENDING = 2
 
+
+def _normalize_group_identifier(value):
+    if isinstance(value, str):
+        value = value.strip()
+        if value:
+            return value
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    return None
+
+
+def _normalize_group_variant(value):
+    if isinstance(value, str):
+        value = value.strip()
+        if value:
+            return value.lower()
+    return None
+
+
+def _collect_nodes_from_field(field):
+    if field is None:
+        return []
+    if isinstance(field, dict):
+        return list(field.keys())
+    if isinstance(field, (list, tuple, set)):
+        return list(field)
+    return [field]
+
+
+def extract_node_groups(prompt, extra_data):
+    group_config = {}
+
+    prompt_nodes = {
+        str(node_id): node_info
+        for node_id, node_info in prompt.items()
+        if isinstance(node_info, dict) and "class_type" in node_info
+    }
+    prompt_node_ids = set(prompt_nodes.keys())
+
+    def ensure_entry(group_id):
+        group_id = _normalize_group_identifier(group_id)
+        if group_id is None:
+            return None
+        entry = group_config.setdefault(group_id, {"variant": None, "nodes": set()})
+        return group_id, entry
+
+    def add_node_to_group(node_id, group_id, variant=None):
+        node_id = str(node_id)
+        if node_id not in prompt_node_ids:
+            return
+        normalized_variant = _normalize_group_variant(variant)
+        result = ensure_entry(group_id)
+        if result is None:
+            return
+        group_id, entry = result
+        entry["nodes"].add(node_id)
+        if normalized_variant and entry["variant"] is None:
+            entry["variant"] = normalized_variant
+
+    def add_group_members(group_id, nodes, variant=None):
+        normalized_variant = _normalize_group_variant(variant)
+        result = ensure_entry(group_id)
+        if result is None:
+            return
+        group_id, entry = result
+        if normalized_variant and entry["variant"] is None:
+            entry["variant"] = normalized_variant
+        for node_id in nodes:
+            add_node_to_group(node_id, group_id)
+
+    def process_group_container(container):
+        if isinstance(container, dict):
+            keys = list(container.keys())
+            if keys and all(str(k) in prompt_node_ids for k in keys):
+                for node_key, info in container.items():
+                    group_id = None
+                    variant = None
+                    if isinstance(info, dict):
+                        group_id = (
+                            info.get("group")
+                            or info.get("id")
+                            or info.get("group_id")
+                            or info.get("groupId")
+                        )
+                        variant = (
+                            info.get("variant")
+                            or info.get("group_variant")
+                            or info.get("variantName")
+                            or info.get("type")
+                        )
+                    else:
+                        group_id = info
+                    add_node_to_group(node_key, group_id, variant)
+                return
+
+            for group_key, info in container.items():
+                group_id = (
+                    (info.get("id") if isinstance(info, dict) else None)
+                    or (info.get("group") if isinstance(info, dict) else None)
+                    or (info.get("group_id") if isinstance(info, dict) else None)
+                    or (info.get("groupId") if isinstance(info, dict) else None)
+                    or group_key
+                )
+                variant = None
+                nodes = []
+                if isinstance(info, dict):
+                    variant = (
+                        info.get("variant")
+                        or info.get("group_variant")
+                        or info.get("variantName")
+                        or info.get("type")
+                    )
+                    nodes = _collect_nodes_from_field(
+                        info.get("nodes")
+                        or info.get("members")
+                        or info.get("node_ids")
+                        or info.get("nodeIds")
+                    )
+                    if not nodes and "node" in info:
+                        nodes = _collect_nodes_from_field(info.get("node"))
+                elif isinstance(info, (list, tuple, set)):
+                    nodes = list(info)
+                else:
+                    variant = info
+                    nodes = []
+
+                add_group_members(group_id, nodes, variant)
+        elif isinstance(container, list):
+            for item in container:
+                if not isinstance(item, dict):
+                    continue
+                group_id = (
+                    item.get("id")
+                    or item.get("group")
+                    or item.get("group_id")
+                    or item.get("groupId")
+                )
+                variant = (
+                    item.get("variant")
+                    or item.get("group_variant")
+                    or item.get("variantName")
+                    or item.get("type")
+                )
+                nodes = _collect_nodes_from_field(
+                    item.get("nodes")
+                    or item.get("members")
+                    or item.get("node_ids")
+                    or item.get("nodeIds")
+                    or item.get("node")
+                )
+                add_group_members(group_id, nodes, variant)
+
+    for key in ("node_groups", "groups", "nodeGroups"):
+        value = extra_data.get(key) if isinstance(extra_data, dict) else None
+        if value is not None:
+            process_group_container(value)
+
+    for node_id, node_info in prompt_nodes.items():
+        group_meta = node_info.get("group")
+        variant = (
+            node_info.get("group_variant")
+            or node_info.get("groupVariant")
+            or (group_meta.get("variant") if isinstance(group_meta, dict) else None)
+            or (group_meta.get("group_variant") if isinstance(group_meta, dict) else None)
+            or (group_meta.get("variantName") if isinstance(group_meta, dict) else None)
+            or (group_meta.get("type") if isinstance(group_meta, dict) else None)
+        )
+        if isinstance(group_meta, dict):
+            group_id = (
+                group_meta.get("id")
+                or group_meta.get("group")
+                or group_meta.get("group_id")
+                or group_meta.get("groupId")
+            )
+            members = _collect_nodes_from_field(
+                group_meta.get("nodes")
+                or group_meta.get("members")
+                or group_meta.get("node_ids")
+                or group_meta.get("nodeIds")
+            )
+            add_group_members(group_id, members, variant)
+            add_node_to_group(node_id, group_id, variant)
+        elif group_meta is not None:
+            add_node_to_group(node_id, group_meta, variant)
+        else:
+            for key in ("group_id", "groupId"):
+                if key in node_info:
+                    add_node_to_group(node_id, node_info[key], variant)
+                    break
+
+    for group_id, entry in list(group_config.items()):
+        entry["nodes"] = {node_id for node_id in entry["nodes"] if node_id in prompt_node_ids}
+        if not entry["nodes"]:
+            del group_config[group_id]
+
+    return group_config
+
 class DuplicateNodeError(Exception):
     pass
 
@@ -686,7 +884,8 @@ class PromptExecutor:
             pending_subgraph_results = {}
             pending_async_nodes = {} # TODO - Unify this with pending_subgraph_results
             executed = set()
-            execution_list = ExecutionList(dynamic_prompt, self.caches.outputs)
+            group_config = extract_node_groups(dynamic_prompt.get_original_prompt(), extra_data)
+            execution_list = ExecutionList(dynamic_prompt, self.caches.outputs, group_config)
             current_outputs = self.caches.outputs.all_node_ids()
             for node_id in list(execute_outputs):
                 execution_list.add_node(node_id)
@@ -697,16 +896,78 @@ class PromptExecutor:
                     self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
                     break
 
-                assert node_id is not None, "Node ID should not be None at this point"
-                result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes)
-                self.success = result != ExecutionResult.FAILURE
-                if result == ExecutionResult.FAILURE:
-                    self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
-                    break
-                elif result == ExecutionResult.PENDING:
-                    execution_list.unstage_node_execution()
-                else: # result == ExecutionResult.SUCCESS:
-                    execution_list.complete_node_execution()
+                if isinstance(node_id, list):
+                    node_ids = node_id
+                else:
+                    node_ids = [node_id]
+
+                assert len(node_ids) > 0, "Node ID should not be None at this point"
+
+                if len(node_ids) == 1:
+                    target_node = node_ids[0]
+                    result, error, ex = await execute(
+                        self.server,
+                        dynamic_prompt,
+                        self.caches,
+                        target_node,
+                        extra_data,
+                        executed,
+                        prompt_id,
+                        execution_list,
+                        pending_subgraph_results,
+                        pending_async_nodes,
+                    )
+                    self.success = result != ExecutionResult.FAILURE
+                    if result == ExecutionResult.FAILURE:
+                        self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
+                        break
+                    elif result == ExecutionResult.PENDING:
+                        execution_list.unstage_node_execution()
+                    else:  # result == ExecutionResult.SUCCESS:
+                        execution_list.complete_node_execution()
+                else:
+                    try:
+                        results = await asyncio.gather(
+                            *[
+                                execute(
+                                    self.server,
+                                    dynamic_prompt,
+                                    self.caches,
+                                    n_id,
+                                    extra_data,
+                                    executed,
+                                    prompt_id,
+                                    execution_list,
+                                    pending_subgraph_results,
+                                    pending_async_nodes,
+                                )
+                                for n_id in node_ids
+                            ]
+                        )
+                    except Exception as ex:  # pragma: no cover - defensive
+                        logging.exception("Unexpected exception during batch execution")
+                        raise ex
+
+                    failure_record = None
+                    pending_detected = False
+                    for result_tuple in results:
+                        result_value, error, ex = result_tuple
+                        if result_value == ExecutionResult.FAILURE and failure_record is None:
+                            failure_record = (error, ex)
+                        elif result_value == ExecutionResult.PENDING:
+                            pending_detected = True
+
+                    self.success = failure_record is None
+
+                    if failure_record is not None:
+                        error, ex = failure_record
+                        self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
+                        break
+
+                    if pending_detected:
+                        execution_list.unstage_node_execution()
+                    else:
+                        execution_list.complete_node_execution()
             else:
                 # Only execute when the while-loop ends without break
                 self.add_message("execution_success", { "prompt_id": prompt_id }, broadcast=False)
