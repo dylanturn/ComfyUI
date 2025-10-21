@@ -610,32 +610,41 @@ class BatchGroupState:
         self.pending_nodes = set(nodes)
         self.running_nodes = set()
         self.completed_nodes = set()
+        self.ready_nodes = set()
         self.active = False
 
     def nodes_to_run(self) -> list[str]:
         return sorted(self.pending_nodes)
 
-    def ready_to_run(self, ready_nodes: list[str]) -> bool:
+    def mark_node_ready(self, node_id: str):
+        if node_id in self.pending_nodes:
+            self.ready_nodes.add(node_id)
+
+    def ready_to_run(self) -> bool:
         if not self.pending_nodes:
             return False
-        ready_set = set(ready_nodes)
-        return self.pending_nodes.issubset(ready_set)
+        return self.pending_nodes.issubset(self.ready_nodes)
 
     def mark_running(self, nodes: list[str]):
         self.active = True
         self.running_nodes = set(nodes)
+        for node_id in nodes:
+            self.ready_nodes.discard(node_id)
 
     def mark_success(self, node_id: str):
         self.running_nodes.discard(node_id)
         self.pending_nodes.discard(node_id)
         self.completed_nodes.add(node_id)
+        self.ready_nodes.discard(node_id)
 
     def mark_pending(self, node_id: str):
         self.running_nodes.discard(node_id)
         self.pending_nodes.add(node_id)
+        self.ready_nodes.discard(node_id)
 
     def mark_failure(self, node_id: str):
         self.running_nodes.discard(node_id)
+        self.ready_nodes.discard(node_id)
 
     def finish_iteration(self):
         self.active = False
@@ -674,31 +683,22 @@ class BatchGroupManager:
 
     def update_ready_state(self, ready_nodes: list[str], execution_list: ExecutionList):
         ready_set = set(ready_nodes)
-
-        for node_id in list(self.node_blocks.keys()):
-            if node_id not in ready_set:
-                self._release_block(node_id)
-
         for group in self.groups.values():
             if group.is_complete() or group.active:
                 continue
             pending_ready = group.pending_nodes.intersection(ready_set)
-            if pending_ready and pending_ready != group.pending_nodes:
-                for node_id in pending_ready:
-                    if node_id not in self.node_blocks:
-                        self.node_blocks[node_id] = execution_list.add_external_block(node_id)
-            elif pending_ready == group.pending_nodes and len(pending_ready) > 0:
-                for node_id in list(pending_ready):
-                    if node_id in self.node_blocks:
-                        self._release_block(node_id)
+            for node_id in pending_ready:
+                if node_id not in self.node_blocks:
+                    self.node_blocks[node_id] = execution_list.add_external_block(node_id)
+                    group.mark_node_ready(node_id)
 
-    def get_ready_batch(self, ready_nodes: list[str]) -> BatchGroupState | None:
-        ready_set = set(ready_nodes)
+    def get_ready_batch(self, execution_list: ExecutionList) -> BatchGroupState | None:
         for group in self.groups.values():
             if group.is_complete() or group.active:
                 continue
-            if group.ready_to_run(ready_set):
-                return group
+            if not group.ready_to_run():
+                continue
+            return group
         return None
 
     def prepare_group_for_execution(self, group_state: BatchGroupState):
@@ -850,7 +850,7 @@ class PromptExecutor:
                 if batch_group_manager.has_batches:
                     ready_nodes = execution_list.get_ready_nodes()
                     batch_group_manager.update_ready_state(ready_nodes, execution_list)
-                    group_state = batch_group_manager.get_ready_batch(ready_nodes)
+                    group_state = batch_group_manager.get_ready_batch(execution_list)
                     if group_state is not None:
                         nodes_to_run = group_state.nodes_to_run()
                         if len(nodes_to_run) == 0:
