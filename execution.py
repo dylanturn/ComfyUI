@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 from enum import Enum
-from typing import List, Literal, NamedTuple, Optional, Union
+from typing import Callable, List, Literal, NamedTuple, Optional, Union
 import asyncio
 
 import torch
@@ -602,6 +602,156 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
 
     return (ExecutionResult.SUCCESS, None, None)
 
+
+class BatchGroupState:
+    def __init__(self, group_id: str, nodes: list[str]):
+        self.group_id = group_id
+        self.nodes = tuple(nodes)
+        self.pending_nodes = set(nodes)
+        self.running_nodes = set()
+        self.completed_nodes = set()
+        self.active = False
+
+    def nodes_to_run(self) -> list[str]:
+        return sorted(self.pending_nodes)
+
+    def ready_to_run(self, ready_nodes: list[str]) -> bool:
+        if not self.pending_nodes:
+            return False
+        ready_set = set(ready_nodes)
+        return self.pending_nodes.issubset(ready_set)
+
+    def mark_running(self, nodes: list[str]):
+        self.active = True
+        self.running_nodes = set(nodes)
+
+    def mark_success(self, node_id: str):
+        self.running_nodes.discard(node_id)
+        self.pending_nodes.discard(node_id)
+        self.completed_nodes.add(node_id)
+
+    def mark_pending(self, node_id: str):
+        self.running_nodes.discard(node_id)
+        self.pending_nodes.add(node_id)
+
+    def mark_failure(self, node_id: str):
+        self.running_nodes.discard(node_id)
+
+    def finish_iteration(self):
+        self.active = False
+        self.running_nodes.clear()
+
+    def is_complete(self) -> bool:
+        return len(self.pending_nodes) == 0
+
+
+class BatchGroupManager:
+    def __init__(self, groups_config: dict):
+        self.groups: dict[str, BatchGroupState] = {}
+        self.node_to_group: dict[str, str] = {}
+        self.node_blocks: dict[str, Callable[[], None]] = {}
+
+        for group_id, config in groups_config.items():
+            if not isinstance(config, dict):
+                continue
+            variant = config.get("variant")
+            if not isinstance(variant, str) or variant.lower() != "batch":
+                continue
+            nodes = config.get("nodes", [])
+            if not isinstance(nodes, list):
+                continue
+            normalized_nodes = [str(node) for node in nodes if node is not None]
+            if len(normalized_nodes) == 0:
+                continue
+            group_state = BatchGroupState(str(group_id), normalized_nodes)
+            self.groups[group_state.group_id] = group_state
+            for node_id in normalized_nodes:
+                self.node_to_group[node_id] = group_state.group_id
+
+    @property
+    def has_batches(self) -> bool:
+        return len(self.groups) > 0
+
+    def update_ready_state(self, ready_nodes: list[str], execution_list: ExecutionList):
+        ready_set = set(ready_nodes)
+
+        for node_id in list(self.node_blocks.keys()):
+            if node_id not in ready_set:
+                self._release_block(node_id)
+
+        for group in self.groups.values():
+            if group.is_complete() or group.active:
+                continue
+            pending_ready = group.pending_nodes.intersection(ready_set)
+            if pending_ready and pending_ready != group.pending_nodes:
+                for node_id in pending_ready:
+                    if node_id not in self.node_blocks:
+                        self.node_blocks[node_id] = execution_list.add_external_block(node_id)
+            elif pending_ready == group.pending_nodes and len(pending_ready) > 0:
+                for node_id in list(pending_ready):
+                    if node_id in self.node_blocks:
+                        self._release_block(node_id)
+
+    def get_ready_batch(self, ready_nodes: list[str]) -> BatchGroupState | None:
+        ready_set = set(ready_nodes)
+        for group in self.groups.values():
+            if group.is_complete() or group.active:
+                continue
+            if group.ready_to_run(ready_set):
+                return group
+        return None
+
+    def prepare_group_for_execution(self, group_state: BatchGroupState):
+        for node_id in list(group_state.pending_nodes):
+            if node_id in self.node_blocks:
+                self._release_block(node_id)
+
+    def mark_group_running(self, group_state: BatchGroupState, nodes_to_run: list[str]):
+        group_state.mark_running(nodes_to_run)
+
+    def finish_iteration(self, group_id: str):
+        group = self.groups.get(group_id)
+        if group is not None:
+            group.finish_iteration()
+
+    def group_completed(self, group_id: str) -> bool:
+        group = self.groups.get(group_id)
+        if group is None:
+            return False
+        return group.is_complete()
+
+    def record_success(self, node_id: str):
+        group = self._get_group_for_node(node_id)
+        if group is None:
+            return
+        group.mark_success(node_id)
+        self._release_block(node_id)
+
+    def record_pending(self, node_id: str):
+        group = self._get_group_for_node(node_id)
+        if group is None:
+            return
+        group.mark_pending(node_id)
+        self._release_block(node_id)
+
+    def record_failure(self, node_id: str):
+        group = self._get_group_for_node(node_id)
+        if group is None:
+            return
+        group.mark_failure(node_id)
+        self._release_block(node_id)
+
+    def _get_group_for_node(self, node_id: str) -> BatchGroupState | None:
+        group_id = self.node_to_group.get(node_id)
+        if group_id is None:
+            return None
+        return self.groups.get(group_id)
+
+    def _release_block(self, node_id: str):
+        unblock = self.node_blocks.pop(node_id, None)
+        if unblock is not None:
+            unblock()
+
 class PromptExecutor:
     def __init__(self, server, cache_type=False, cache_size=None):
         self.cache_size = cache_size
@@ -691,11 +841,55 @@ class PromptExecutor:
             for node_id in list(execute_outputs):
                 execution_list.add_node(node_id)
 
+            group_config = extra_data.get("node_execution_groups") or extra_data.get("execution_groups") or extra_data.get("group_execution") or {}
+            if not isinstance(group_config, dict):
+                group_config = {}
+            batch_group_manager = BatchGroupManager(group_config)
+
             while not execution_list.is_empty():
+                if batch_group_manager.has_batches:
+                    ready_nodes = execution_list.get_ready_nodes()
+                    batch_group_manager.update_ready_state(ready_nodes, execution_list)
+                    group_state = batch_group_manager.get_ready_batch(ready_nodes)
+                    if group_state is not None:
+                        nodes_to_run = group_state.nodes_to_run()
+                        if len(nodes_to_run) == 0:
+                            batch_group_manager.finish_iteration(group_state.group_id)
+                            continue
+                        batch_group_manager.prepare_group_for_execution(group_state)
+                        execution_list.stage_batch_nodes(nodes_to_run)
+                        batch_group_manager.mark_group_running(group_state, nodes_to_run)
+                        result, error, ex = await self._execute_batch_group(
+                            group_state,
+                            nodes_to_run,
+                            batch_group_manager,
+                            dynamic_prompt,
+                            execution_list,
+                            pending_subgraph_results,
+                            pending_async_nodes,
+                            extra_data,
+                            executed,
+                            prompt_id,
+                        )
+                        batch_group_manager.finish_iteration(group_state.group_id)
+                        self.success = result != ExecutionResult.FAILURE
+                        if result == ExecutionResult.FAILURE:
+                            self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
+                            break
+                        elif result == ExecutionResult.PENDING:
+                            continue
+                        else:
+                            continue
+
+                execution_list.set_skip_nodes([])
                 node_id, error, ex = await execution_list.stage_node_execution()
                 if error is not None:
                     self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
                     break
+
+                if node_id is None:
+                    await asyncio.sleep(0)
+                    continue
 
                 assert node_id is not None, "Node ID should not be None at this point"
                 result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes)
@@ -704,9 +898,9 @@ class PromptExecutor:
                     self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
                     break
                 elif result == ExecutionResult.PENDING:
-                    execution_list.unstage_node_execution()
+                    execution_list.unstage_node_execution(node_id)
                 else: # result == ExecutionResult.SUCCESS:
-                    execution_list.complete_node_execution()
+                    execution_list.complete_node_execution(node_id)
             else:
                 # Only execute when the while-loop ends without break
                 self.add_message("execution_success", { "prompt_id": prompt_id }, broadcast=False)
@@ -726,6 +920,95 @@ class PromptExecutor:
             self.server.last_node_id = None
             if comfy.model_management.DISABLE_SMART_MEMORY:
                 comfy.model_management.unload_all_models()
+
+    async def _execute_batch_group(
+        self,
+        group_state: BatchGroupState,
+        node_ids: list[str],
+        batch_manager: BatchGroupManager,
+        dynamic_prompt: DynamicPrompt,
+        execution_list: ExecutionList,
+        pending_subgraph_results,
+        pending_async_nodes,
+        extra_data,
+        executed,
+        prompt_id,
+    ):
+        tasks = [
+            execute(
+                self.server,
+                dynamic_prompt,
+                self.caches,
+                node_id,
+                extra_data,
+                executed,
+                prompt_id,
+                execution_list,
+                pending_subgraph_results,
+                pending_async_nodes,
+            )
+            for node_id in node_ids
+        ]
+        node_results = dict(zip(node_ids, await asyncio.gather(*tasks)))
+
+        pending_nodes = [node_id for node_id, (res, _, _) in node_results.items() if res == ExecutionResult.PENDING]
+        while pending_nodes:
+            waiters = []
+            for node_id in pending_nodes:
+                pending = pending_async_nodes.get(node_id, [])
+                for item in pending:
+                    if isinstance(item, asyncio.Task):
+                        waiters.append(item)
+            if waiters:
+                await asyncio.gather(*waiters, return_exceptions=True)
+
+            new_results = {}
+            for node_id in pending_nodes:
+                new_results[node_id] = await execute(
+                    self.server,
+                    dynamic_prompt,
+                    self.caches,
+                    node_id,
+                    extra_data,
+                    executed,
+                    prompt_id,
+                    execution_list,
+                    pending_subgraph_results,
+                    pending_async_nodes,
+                )
+            node_results.update(new_results)
+            pending_nodes = [node_id for node_id, (res, _, _) in new_results.items() if res == ExecutionResult.PENDING]
+            if pending_nodes:
+                break
+
+        combined_result = ExecutionResult.SUCCESS
+        failure_details = None
+
+        for node_id, (node_result, error, ex) in node_results.items():
+            if node_result == ExecutionResult.FAILURE:
+                combined_result = ExecutionResult.FAILURE
+                if failure_details is None:
+                    failure_details = (error, ex)
+            elif node_result == ExecutionResult.PENDING and combined_result != ExecutionResult.FAILURE:
+                combined_result = ExecutionResult.PENDING
+
+        for node_id, (node_result, error, ex) in node_results.items():
+            if node_result == ExecutionResult.SUCCESS:
+                execution_list.complete_node_execution(node_id, release=False)
+                batch_manager.record_success(node_id)
+            elif node_result == ExecutionResult.PENDING:
+                execution_list.unstage_node_execution(node_id)
+                batch_manager.record_pending(node_id)
+            elif node_result == ExecutionResult.FAILURE:
+                execution_list.unstage_node_execution(node_id)
+                batch_manager.record_failure(node_id)
+
+        if combined_result == ExecutionResult.SUCCESS and batch_manager.group_completed(group_state.group_id):
+            execution_list.release_deferred_nodes(group_state.nodes)
+
+        if failure_details is None:
+            return combined_result, None, None
+        return combined_result, failure_details[0], failure_details[1]
 
 
 async def validate_inputs(prompt_id, prompt, item, validated):

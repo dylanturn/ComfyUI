@@ -175,7 +175,21 @@ class TopologicalSort:
         return False
 
     def get_ready_nodes(self):
-        return [node_id for node_id in self.pendingNodes if self.blockCount[node_id] == 0]
+        return [
+            node_id
+            for node_id in self.pendingNodes
+            if self.blockCount[node_id] == 0
+            and node_id not in self.inflight_nodes
+            and node_id not in self.completed_nodes_waiting_release
+        ]
+
+    def stage_batch_nodes(self, node_ids):
+        for node_id in node_ids:
+            if node_id not in self.inflight_nodes:
+                self.inflight_nodes.add(node_id)
+
+    def set_skip_nodes(self, nodes):
+        self.skip_nodes = set(nodes)
 
     def pop_node(self, unique_id):
         del self.pendingNodes[unique_id]
@@ -194,9 +208,11 @@ class ExecutionList(TopologicalSort):
     def __init__(self, dynprompt, output_cache):
         super().__init__(dynprompt)
         self.output_cache = output_cache
-        self.staged_node_id = None
+        self.inflight_nodes = set()
         self.execution_cache = {}
         self.execution_cache_listeners = {}
+        self.completed_nodes_waiting_release = set()
+        self.skip_nodes = set()
 
     def is_cached(self, node_id):
         return self.output_cache.get(node_id) is not None
@@ -224,16 +240,23 @@ class ExecutionList(TopologicalSort):
         self.cache_link(from_node_id, to_node_id)
 
     async def stage_node_execution(self):
-        assert self.staged_node_id is None
         if self.is_empty():
             return None, None, None
         available = self.get_ready_nodes()
-        while len(available) == 0 and self.externalBlocks > 0:
+        original_available = available
+        if len(self.skip_nodes) > 0:
+            available = [node_id for node_id in available if node_id not in self.skip_nodes]
+        while len(available) == 0 and (self.externalBlocks > 0 or (len(original_available) > 0 and len(self.skip_nodes) > 0)):
             # Wait for an external block to be released
             await self.unblockedEvent.wait()
             self.unblockedEvent.clear()
             available = self.get_ready_nodes()
+            original_available = available
+            if len(self.skip_nodes) > 0:
+                available = [node_id for node_id in available if node_id not in self.skip_nodes]
         if len(available) == 0:
+            if len(original_available) > 0 and len(self.skip_nodes) > 0:
+                return None, None, None
             cycled_nodes = self.get_nodes_in_cycle()
             # Because cycles composed entirely of static nodes are caught during initial validation,
             # we will 'blame' the first node in the cycle that is not a static node.
@@ -253,8 +276,9 @@ class ExecutionList(TopologicalSort):
             }
             return None, error_details, ex
 
-        self.staged_node_id = self.ux_friendly_pick_node(available)
-        return self.staged_node_id, None, None
+        node_id = self.ux_friendly_pick_node(available)
+        self.inflight_nodes.add(node_id)
+        return node_id, None, None
 
     def ux_friendly_pick_node(self, node_list):
         # If an output node is available, do that first.
@@ -295,16 +319,31 @@ class ExecutionList(TopologicalSort):
         #TODO: this function should be improved
         return node_list[0]
 
-    def unstage_node_execution(self):
-        assert self.staged_node_id is not None
-        self.staged_node_id = None
+    def unstage_node_execution(self, node_id):
+        if node_id in self.inflight_nodes:
+            self.inflight_nodes.remove(node_id)
 
-    def complete_node_execution(self):
-        node_id = self.staged_node_id
+    def complete_node_execution(self, node_id, release=True):
+        if node_id in self.inflight_nodes:
+            self.inflight_nodes.remove(node_id)
+        if release:
+            self._finalize_node(node_id)
+        else:
+            self.completed_nodes_waiting_release.add(node_id)
+
+    def release_deferred_node(self, node_id):
+        if node_id in self.completed_nodes_waiting_release:
+            self.completed_nodes_waiting_release.remove(node_id)
+            self._finalize_node(node_id)
+
+    def release_deferred_nodes(self, node_ids):
+        for node_id in node_ids:
+            self.release_deferred_node(node_id)
+
+    def _finalize_node(self, node_id):
         self.pop_node(node_id)
         self.execution_cache.pop(node_id, None)
         self.execution_cache_listeners.pop(node_id, None)
-        self.staged_node_id = None
 
     def get_nodes_in_cycle(self):
         # We'll dissolve the graph in reverse topological order to leave only the nodes in the cycle.
