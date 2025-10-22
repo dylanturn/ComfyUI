@@ -124,6 +124,40 @@ class BlockingBatchNodeB:
         return ("B",)
 
 
+class AsyncBlockingBatchNodeA:
+    CATEGORY = "tests"
+    FUNCTION = "execute"
+    RETURN_TYPES = ("STRING",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    @classmethod
+    async def execute(cls):
+        BatchBarrier.results.append(("async_block_start", "A", time.perf_counter()))
+        time.sleep(0.05)
+        BatchBarrier.results.append(("async_block_end", "A", time.perf_counter()))
+        return ("A",)
+
+
+class AsyncBlockingBatchNodeB:
+    CATEGORY = "tests"
+    FUNCTION = "execute"
+    RETURN_TYPES = ("STRING",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    @classmethod
+    async def execute(cls):
+        BatchBarrier.results.append(("async_block_start", "B", time.perf_counter()))
+        time.sleep(0.05)
+        BatchBarrier.results.append(("async_block_end", "B", time.perf_counter()))
+        return ("B",)
+
+
 class AsyncSourceFast:
     CATEGORY = "tests"
     FUNCTION = "execute"
@@ -194,6 +228,8 @@ def register_batch_nodes():
         "BatchOutputNode": BatchOutputNode,
         "BlockingBatchNodeA": BlockingBatchNodeA,
         "BlockingBatchNodeB": BlockingBatchNodeB,
+        "AsyncBlockingBatchNodeA": AsyncBlockingBatchNodeA,
+        "AsyncBlockingBatchNodeB": AsyncBlockingBatchNodeB,
         "AsyncSourceFast": AsyncSourceFast,
         "AsyncSourceSlow": AsyncSourceSlow,
         "DependentBatchNodeA": DependentBatchNodeA,
@@ -350,6 +386,51 @@ async def test_batch_group_runs_blocking_nodes_with_threaded_execution():
 
     first_end_index = min(i for i, entry in enumerate(BatchBarrier.results) if entry[0] == "block_end")
     last_start_index = max(i for i, entry in enumerate(BatchBarrier.results) if entry[0] == "block_start")
+    assert last_start_index < first_end_index
+
+    assert duration < 0.09
+
+
+@pytest.mark.asyncio
+async def test_batch_group_runs_async_blocking_nodes_with_threaded_execution():
+    BatchBarrier.reset()
+    server = DummyServer()
+    executor = PromptExecutor(server)
+
+    prompt = {
+        "200": {"class_type": "AsyncBlockingBatchNodeA", "inputs": {}},
+        "201": {"class_type": "AsyncBlockingBatchNodeB", "inputs": {}},
+        "202": {
+            "class_type": "BatchOutputNode",
+            "inputs": {
+                "first": ["200", 0],
+                "second": ["201", 0],
+            },
+        },
+    }
+
+    extra_data = {
+        "node_execution_groups": {
+            "group": {
+                "variant": "batch",
+                "nodes": ["200", "201"],
+            }
+        }
+    }
+
+    start = time.perf_counter()
+    await executor.execute_async(prompt, "test_prompt", extra_data, execute_outputs=["202"])
+    duration = time.perf_counter() - start
+
+    assert executor.success
+
+    block_starts = [entry for entry in BatchBarrier.results if entry[0] == "async_block_start"]
+    block_ends = [entry for entry in BatchBarrier.results if entry[0] == "async_block_end"]
+    assert len(block_starts) == 2
+    assert len(block_ends) == 2
+
+    first_end_index = min(i for i, entry in enumerate(BatchBarrier.results) if entry[0] == "async_block_end")
+    last_start_index = max(i for i, entry in enumerate(BatchBarrier.results) if entry[0] == "async_block_start")
     assert last_start_index < first_end_index
 
     assert duration < 0.09

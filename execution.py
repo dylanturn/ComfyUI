@@ -273,17 +273,25 @@ async def _async_map_node_over_list(
             else:
                 f = getattr(obj, func)
             if inspect.iscoroutinefunction(f):
-                async def async_wrapper(f, prompt_id, unique_id, list_index, args):
-                    with CurrentNodeContext(prompt_id, unique_id, list_index):
-                        return await f(**args)
-                task = asyncio.create_task(async_wrapper(f, prompt_id, unique_id, index, args=inputs))
-                # Give the task a chance to execute without yielding
-                await asyncio.sleep(0)
-                if task.done():
-                    result = task.result()
+                async def async_call():
+                    with CurrentNodeContext(prompt_id, unique_id, index):
+                        return await f(**inputs)
+
+                if run_in_executor:
+                    def run_coroutine():
+                        return asyncio.run(async_call())
+
+                    result = await asyncio.to_thread(run_coroutine)
                     results.append(result)
                 else:
-                    results.append(task)
+                    task = asyncio.create_task(async_call())
+                    # Give the task a chance to execute without yielding
+                    await asyncio.sleep(0)
+                    if task.done():
+                        result = task.result()
+                        results.append(result)
+                    else:
+                        results.append(task)
             else:
                 def call_sync():
                     with CurrentNodeContext(prompt_id, unique_id, index):
