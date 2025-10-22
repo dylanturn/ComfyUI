@@ -260,6 +260,57 @@ async def test_batch_group_executes_nodes_concurrently():
 
 
 @pytest.mark.asyncio
+async def test_batch_group_configured_via_workflow_extra_pnginfo():
+    BatchBarrier.reset()
+    server = DummyServer()
+    executor = PromptExecutor(server)
+
+    prompt = {
+        "1": {"class_type": "BatchNodeA", "inputs": {}},
+        "2": {"class_type": "BatchNodeB", "inputs": {}},
+        "3": {
+            "class_type": "BatchOutputNode",
+            "inputs": {
+                "first": ["1", 0],
+                "second": ["2", 0],
+            },
+        },
+    }
+
+    extra_data = {
+        "extra_pnginfo": {
+            "workflow": {
+                "extra": {
+                    "node_execution_groups": {
+                        "group": {
+                            "variant": "batch",
+                            "nodes": ["1", "2"],
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    await executor.execute_async(prompt, "test_prompt", extra_data, execute_outputs=["3"])
+
+    assert executor.success
+
+    start_entries = [entry for entry in BatchBarrier.results if entry[0] == "start"]
+    end_entries = [entry for entry in BatchBarrier.results if entry[0] == "end"]
+    assert len(start_entries) == 2
+    assert len(end_entries) == 2
+
+    first_end_index = next(i for i, entry in enumerate(BatchBarrier.results) if entry[0] == "end")
+    start_indices = [i for i, entry in enumerate(BatchBarrier.results) if entry[0] == "start"]
+    assert start_indices[-1] < first_end_index
+
+    output_index = next(i for i, entry in enumerate(BatchBarrier.results) if entry[0] == "output")
+    end_indices = [i for i, entry in enumerate(BatchBarrier.results) if entry[0] == "end"]
+    assert all(i < output_index for i in end_indices)
+
+
+@pytest.mark.asyncio
 async def test_batch_group_runs_blocking_nodes_with_threaded_execution():
     BatchBarrier.reset()
     server = DummyServer()

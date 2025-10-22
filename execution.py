@@ -899,8 +899,22 @@ class PromptExecutor:
             for node_id in list(execute_outputs):
                 execution_list.add_node(node_id)
 
-            group_config = extra_data.get("node_execution_groups") or extra_data.get("execution_groups") or extra_data.get("group_execution") or {}
-            if not isinstance(group_config, dict):
+            def _extract_group_config(source):
+                if not isinstance(source, dict):
+                    return None
+                for key in ("node_execution_groups", "execution_groups", "group_execution"):
+                    candidate = source.get(key)
+                    if isinstance(candidate, dict):
+                        return candidate
+                return None
+
+            group_config = _extract_group_config(extra_data)
+            if group_config is None:
+                workflow = extra_data.get("extra_pnginfo", {}).get("workflow")
+                if isinstance(workflow, dict):
+                    workflow_extra = workflow.get("extra")
+                    group_config = _extract_group_config(workflow_extra) or _extract_group_config(workflow)
+            if group_config is None:
                 group_config = {}
             batch_group_manager = BatchGroupManager(group_config)
 
