@@ -36,6 +36,9 @@ from comfy_api.internal import _ComfyNodeInternal, _NodeOutputInternal, first_re
 from comfy_api.latest import io
 
 
+logger = logging.getLogger(__name__)
+
+
 class ExecutionResult(Enum):
     SUCCESS = 0
     FAILURE = 1
@@ -743,12 +746,22 @@ class BatchGroupManager:
             for node_id in normalized_nodes:
                 self.node_to_group[node_id] = group_state.group_id
 
+        if self.groups:
+            logger.debug(
+                "Initialized batch manager with groups: %s",
+                {group_id: state.nodes for group_id, state in self.groups.items()},
+            )
+        else:
+            logger.debug("Initialized batch manager without batch groups")
+
     @property
     def has_batches(self) -> bool:
         return len(self.groups) > 0
 
     def update_ready_state(self, ready_nodes: list[str], execution_list: ExecutionList):
         ready_set = set(ready_nodes)
+        if ready_set:
+            logger.debug("Ready nodes before batch gating: %s", sorted(ready_set))
         for group in self.groups.values():
             if group.is_complete() or group.active:
                 continue
@@ -757,6 +770,13 @@ class BatchGroupManager:
                 if node_id not in self.node_blocks:
                     self.node_blocks[node_id] = execution_list.add_external_block(node_id)
                     group.mark_node_ready(node_id)
+                    logger.debug(
+                        "Batch %s marked node %s ready and applied block (pending=%s ready=%s)",
+                        group.group_id,
+                        node_id,
+                        sorted(group.pending_nodes),
+                        sorted(group.ready_nodes),
+                    )
 
     def get_ready_batch(self, execution_list: ExecutionList) -> BatchGroupState | None:
         for group in self.groups.values():
@@ -764,6 +784,11 @@ class BatchGroupManager:
                 continue
             if not group.ready_to_run():
                 continue
+            logger.debug(
+                "Batch %s is ready to launch with nodes %s",
+                group.group_id,
+                sorted(group.pending_nodes),
+            )
             return group
         return None
 
@@ -771,9 +796,19 @@ class BatchGroupManager:
         for node_id in list(group_state.pending_nodes):
             if node_id in self.node_blocks:
                 self._release_block(node_id)
+                logger.debug(
+                    "Batch %s released block for node %s prior to launch",
+                    group_state.group_id,
+                    node_id,
+                )
 
     def mark_group_running(self, group_state: BatchGroupState, nodes_to_run: list[str]):
         group_state.mark_running(nodes_to_run)
+        logger.debug(
+            "Batch %s starting nodes %s",
+            group_state.group_id,
+            nodes_to_run,
+        )
 
     def finish_iteration(self, group_id: str):
         group = self.groups.get(group_id)
@@ -792,6 +827,12 @@ class BatchGroupManager:
             return
         group.mark_success(node_id)
         self._release_block(node_id)
+        logger.debug(
+            "Batch %s node %s finished successfully (%d remaining)",
+            group.group_id,
+            node_id,
+            len(group.pending_nodes),
+        )
 
     def record_pending(self, node_id: str):
         group = self._get_group_for_node(node_id)
@@ -799,6 +840,9 @@ class BatchGroupManager:
             return
         group.mark_pending(node_id)
         self._release_block(node_id)
+        logger.debug(
+            "Batch %s node %s returned pending", group.group_id, node_id
+        )
 
     def record_failure(self, node_id: str):
         group = self._get_group_for_node(node_id)
@@ -806,6 +850,9 @@ class BatchGroupManager:
             return
         group.mark_failure(node_id)
         self._release_block(node_id)
+        logger.debug(
+            "Batch %s node %s failed", group.group_id, node_id
+        )
 
     def _get_group_for_node(self, node_id: str) -> BatchGroupState | None:
         group_id = self.node_to_group.get(node_id)
@@ -817,6 +864,7 @@ class BatchGroupManager:
         unblock = self.node_blocks.pop(node_id, None)
         if unblock is not None:
             unblock()
+            logger.debug("Released external block for node %s", node_id)
 
 class PromptExecutor:
     def __init__(self, server, cache_type=False, cache_size=None):
@@ -1030,10 +1078,23 @@ class PromptExecutor:
             )
             for node_id in node_ids
         ]
+        logger.debug(
+            "Launching batch %s with nodes %s", group_state.group_id, node_ids
+        )
         node_results = dict(zip(node_ids, await asyncio.gather(*tasks)))
+        logger.debug(
+            "Batch %s initial results: %s",
+            group_state.group_id,
+            {node_id: result[0].name for node_id, result in node_results.items()},
+        )
 
         pending_nodes = [node_id for node_id, (res, _, _) in node_results.items() if res == ExecutionResult.PENDING]
         while pending_nodes:
+            logger.debug(
+                "Batch %s has pending nodes %s; waiting for async completions",
+                group_state.group_id,
+                pending_nodes,
+            )
             waiters = []
             for node_id in pending_nodes:
                 pending = pending_async_nodes.get(node_id, [])
@@ -1062,6 +1123,11 @@ class PromptExecutor:
             pending_nodes = [node_id for node_id, (res, _, _) in new_results.items() if res == ExecutionResult.PENDING]
             if pending_nodes:
                 break
+            logger.debug(
+                "Batch %s recheck results: %s",
+                group_state.group_id,
+                {node_id: result[0].name for node_id, result in new_results.items()},
+            )
 
         combined_result = ExecutionResult.SUCCESS
         failure_details = None
@@ -1087,6 +1153,7 @@ class PromptExecutor:
 
         if combined_result == ExecutionResult.SUCCESS and batch_manager.group_completed(group_state.group_id):
             execution_list.release_deferred_nodes(group_state.nodes)
+            logger.debug("Batch %s fully complete", group_state.group_id)
 
         if failure_details is None:
             return combined_result, None, None
